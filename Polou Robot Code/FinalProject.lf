@@ -1,0 +1,360 @@
+/**
+ * Line following robot program that continuously tracks and follows 
+ * a line (U-shaped or infinity symbol shaped).
+ * The robot detects the line using reflectance sensors and adjusts its
+ * movement to stay on the line.
+ */
+ target C {
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true
+}
+
+
+
+import Line from "lib/Line.lf"
+import Display from "lib/Display.lf"
+import Motors from "lib/Motors.lf"
+import Bump from "lib/Bump.lf"
+
+preamble {=
+  #include <stdio.h>
+  #include <pico/stdlib.h>
+  #include <hardware/gpio.h>
+  #include <hardware/uart.h>
+
+  #define UART_RX_PIN 29
+  #define UART_TX_PIN 28
+
+
+  static void setNullString(char* str, int len) {
+    for (int i = 0; i < len; i++) {
+      str[i] = '\0';
+    }
+  }
+=}
+
+main reactor(calibration_time: time = 5 s, sample_period: time = 10 ms) {
+  line = new Line()
+  disp = new Display()
+  motors = new Motors()
+  bump = new Bump()
+
+  timer t(0, sample_period)
+  timer uartT(0, 50 ms)
+  timer seconds(0, 1 s)  // Timer used to display seconds.
+  timer end_calibration(calibration_time)
+  state count: int = 0
+  state refAngle: float = 0.0
+  //Network command parameters
+  state connected: bool = false
+  state commandRecieved: bool = false
+  state Command: char[30] = ""
+
+  state recovered: bool
+
+
+  
+  // PID controller variables for smooth line following
+  state lastError: float = 0.0
+  state integral: float = 0.0
+  
+  // Timeout mechanism to prevent infinite turning
+  state searchStartTime: instant_t = 0
+  state stuckTimeout: interval_t = 2000000000  // 2 seconds in nanoseconds
+  state searchPhase: int = 0  // To track different search behaviors
+  state secondsElapsed: int = 0
+  state batteryLife: float = 100
+  
+  // PID constants - adjust as needed for your robot and track
+  state kp: float = 0.35  // Higher proportional gain for stronger response
+  state ki: float = 0.01  // Moderate integral gain 
+  state kd: float = 0.3   // Moderate derivative gain
+  
+  // Base speed for forward movement
+  state baseSpeed: float = 0.2  // Increased base speed
+  state direction: int = 1;
+
+
+  reaction(startup) -> disp.line0, disp.line1, disp.line2, motors.left_power, motors.right_power {=
+    lf_set(disp.line0, "CALIBRATING");
+    lf_set(disp.line1, "Roll robot over");
+    lf_set(disp.line2, "line sample.");
+    lf_set(motors.left_power, 0.0);
+    lf_set(motors.right_power, 0.0);
+
+    // Setup UART
+    uart_init(uart0, 115200);
+    gpio_init(UART_RX_PIN);
+    gpio_init(UART_TX_PIN);
+
+    gpio_set_dir(UART_TX_PIN, GPIO_OUT);
+    gpio_set_dir(UART_RX_PIN, GPIO_IN);
+
+    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+
+
+  =}
+
+  reaction(seconds) -> disp.line3 {=
+    self->batteryLife =  ( ( 60.0*10.0 - (float)self->secondsElapsed) / (60.0*10.0) ) * 100.0;
+    static char buf[32];
+    snprintf(buf, 31, "Battery: %.1f%", self->batteryLife);
+    lf_set(disp.line3, buf);
+
+    self->secondsElapsed++;
+
+
+  =}
+
+  reaction(bump.right, bump.left) {=
+    self->direction= 0;
+    uart_puts(uart0, "Bump Detected, STOPPED\n");
+
+  =}
+
+  reaction(t) -> line.trigger {=
+    lf_set(line.trigger, true);
+  =}
+
+  // Process commands
+  reaction (uartT) -> disp.line2 {=
+
+    int i = 0;
+    char UARTbuf[30];
+
+    
+    for (i = 0; uart_is_readable(uart0); i++) {
+        UARTbuf[i] = uart_getc(uart0);
+    }
+    
+    UARTbuf[i+1] = '\0'; 
+
+    if (strlen(UARTbuf) > 2) {
+      printf("UART buffer: %s\n", UARTbuf);
+    }
+
+
+    for (i = 0; UARTbuf[i] != '\n' && UARTbuf[i] != '\0'; i++) {
+        self->Command[i] = UARTbuf[i];
+    }
+
+    self->Command[i+1] = '\0';
+    if (strlen(self->Command) > 2) {
+      printf("Command recieved: %s\n", self->Command);
+      
+      printf("Connected strcmp = %d\n", strcmp(self->Command, "Connected"));
+      printf("Disconnected strcmp = %d\n", strcmp(self->Command, "Disconnected"));
+
+      if (strcmp(self->Command, "Connected") == 0) {
+          self->connected = true;
+          lf_set(disp.line2, "BLE Connected");
+          printf("BLE Connection status: %d \n", self->connected);
+      }
+      else if (strcmp(self->Command, "Disconnected") == 0) {
+          self->connected = false;
+          printf("BLE Disconnection status: %d \n", self->connected);
+          lf_set(disp.line2, "BLE NO CONN");
+      }
+      else if (strcmp(self->Command, "FORWARD") == 0) {
+          self->direction = 1; // 1 = forward
+      }
+      else if (strcmp(self->Command, "REVERSE") == 0) {
+          self->direction = -1; // -1 = reverse
+      }
+      else if (strcmp(self->Command, "STOP") == 0) {
+          self->direction = 0; // 0 = stop
+      }
+      else if (strncmp(self->Command, "SPEED", 5) == 0) {
+          int value = atoi(self->Command + 6);  // Expects format: "SPEED x", e.g., "SPEED 3"
+          if (value >= 1 && value <= 9) {
+              self->baseSpeed = value * 0.03f;  // Convert to float: 1 -> 0.1, ..., 9 -> 0.9
+              printf("Base speed set to %.1f\n", self->baseSpeed);
+          } else {
+              printf("Invalid SPEED value: %s\n", self->Command);
+          }
+      }
+
+      else if (strcmp(self->Command, "STATE") == 0) {
+        char STATEinfo[100];
+        snprintf(STATEinfo, 99, "Current Speed: %d\n Current Diretion: %d\n Current Battery: %f%\n", self->direction, self->baseSpeed, self->batteryLife);
+        uart_puts(uart0, STATEinfo);
+      }
+      else {
+          printf("Unknown command: %s\n", self->Command);
+      }
+
+      // Reset command buffer
+      setNullString(self->Command, strlen(self->Command));
+  }
+
+    
+    =}
+
+
+ 
+  initial mode CALIBRATION {
+    reaction(end_calibration) -> reset(FOLLOWING), motors.left_power, motors.right_power, disp.line0, disp.line1, disp.line2, line.calibrate {=
+      // End calibration and switch to line following mode
+      lf_set(line.calibrate, false);
+      lf_set(disp.line0, "FOLLOWING");
+      lf_set(disp.line1, "");
+      lf_set(disp.line2, "");
+      lf_set(motors.left_power, self->baseSpeed);
+      lf_set(motors.right_power, self->baseSpeed);
+      lf_set_mode(FOLLOWING);
+      printf("Calibration complete, entering LINE FOLLOWING mode\n");
+    =}
+  }
+
+  mode FOLLOWING {
+    reaction(line.reflect) -> disp.line0, disp.line1, disp.line2, motors.left_power, motors.right_power {=
+      // Display the sensor values for debugging
+      static char buf[32];
+      snprintf(buf, 31, "S:%d %d %d ", 
+              
+               line.reflect->value[1], 
+               line.reflect->value[2], 
+               line.reflect->value[3]);
+      lf_set(disp.line1, buf);
+      
+      // Calculate position of line relative to center
+      float position = 0.0;
+      float sum = 0.0;
+      
+      if (self->direction == 0) {
+        lf_set(disp.line0, "STOPPED");
+        lf_set(motors.left_power, 0);
+        lf_set(motors.right_power, 0);
+      }
+
+      else {
+        // Check if line is detected
+        if (line.reflect->value[1] > 900 && line.reflect->value[2] > 900 && line.reflect->value[3] > 900) {
+          lf_set(disp.line0, "STRAIGHT");
+          float left_power = self->baseSpeed * self->direction;
+          float right_power = self->baseSpeed * self->direction;
+          
+          if (!self->recovered){
+            uart_puts(uart0, "Moving Straight, on track\n");
+            self->recovered = true;
+          }
+
+          // Apply motor powers
+          lf_set(motors.left_power, left_power);
+          lf_set(motors.right_power, right_power);
+          self->searchStartTime = 0;
+          
+          
+        }
+        else if (line.reflect->value[1] <  line.reflect->value[3] && line.reflect->value[3] > 100 ) {
+          // Rotate right more aggressively
+          lf_set(disp.line0, "SEARCH-RIGHT");
+          lf_set(motors.left_power, 0.1);
+          lf_set(motors.right_power, -0.1);
+          self->searchStartTime = 0;
+
+        
+
+          if (self->recovered){
+            uart_puts(uart0, "Left IR Sensor off light, turning Left to recover\n");
+            self->recovered = false;
+          }
+
+        }
+        else if (line.reflect->value[3] <  line.reflect->value[1] && line.reflect->value[1] > 100) {
+          // Rotate right more aggressively
+          lf_set(disp.line0, "SEARCH-LEFT");
+          lf_set(motors.left_power, -0.1);
+          lf_set(motors.right_power, 0.1);
+
+          if (self->recovered){
+            uart_puts(uart0, "Right IR Sensor off light, turning Left to recover\n");
+            self->recovered = false;
+          }
+
+
+
+          self->searchStartTime = 0;
+
+        }
+        
+        else {
+
+          if (self->recovered){
+            uart_puts(uart0, "Deep Searching for Line\n");
+            self->recovered = false;
+          }
+          
+          // No line detected, enter search mode
+          if (self->searchStartTime == 0) {
+            // First time entering search mode, record start time
+            self->searchStartTime = lf_time_physical();
+            self->searchPhase = 0;
+            lf_set(disp.line0, "SEARCH-ROTATE");
+            
+            // Start with rotation to find the line
+            lf_set(motors.left_power, 0.1);
+            lf_set(motors.right_power, -0.1);
+            
+          } 
+          
+          else {
+            // Already in search mode, check if we're stuck
+            instant_t current_time = lf_time_physical();
+            
+            // Progress through different search phases if stuck too long
+            if (current_time - self->searchStartTime > self->stuckTimeout) {
+              // Switch to next search phase
+              self->searchPhase = (self->searchPhase + 1) % 4;
+              self->searchStartTime = current_time;  // Reset timer
+              
+              // Different behaviors based on search phase
+              switch (self->searchPhase) {
+                case 0:
+                  // Rotate left more aggressively
+                  lf_set(disp.line0, "SEARCH-LEFT");
+                  lf_set(motors.left_power, -0.1);
+                  lf_set(motors.right_power, 0.1);
+                  
+                  break;
+                case 1:
+                  // Move forward with slight right bias
+                  lf_set(disp.line0, "SEARCH-FORWARD");
+                  lf_set(motors.left_power, 0.15);
+                  lf_set(motors.right_power, 0.1);
+                
+                  break;
+                case 2:
+                  // Rotate right more aggressively
+                  lf_set(disp.line0, "SEARCH-RIGHT");
+                  lf_set(motors.left_power, 0.1);
+                  lf_set(motors.right_power, -0.1);
+                  
+                  break;
+                case 3:
+                  // Move forward with slight left bias
+                  lf_set(disp.line0, "SEARCH-FORWARD2");
+                  lf_set(motors.left_power, 0.1);
+                  lf_set(motors.right_power, 0.15);
+                  
+                  break;
+              }
+            } else if (self->searchPhase == 0) {
+              // Continue with initial rotation strategy
+              lf_set(motors.left_power, -0.1);
+              lf_set(motors.right_power, 0.1);
+            }
+            // For other phases, let them continue with their current power settings
+          }
+        }
+      }
+    =}
+  }
+}
