@@ -1,6 +1,6 @@
-Line Following AGV with Bluetooth Control - Setup Guide
+##Line Following AGV with Bluetooth Control - Setup Guide
 This guide explains how to set up the Raspberry Pi Pico W2 and Pololu 3pi+ 2040 Robot for the networked line-following AGV project.
-Hardware Requirements
+#Hardware Requirements
 
 Pololu 3pi+ 2040 Robot
 Raspberry Pi Pico W2 (with Bluetooth)
@@ -8,13 +8,13 @@ USB cables for programming both devices
 Line track (black line on white background)
 Computer with Python and required tools installed
 
-Software Requirements
+#Software Requirements
 
 MicroPython for the Pico W2
 Lingua Franca C runtime for the Pololu 3pi+ 2040
 Terminal software (e.g., Thonny for MicroPython)
 
-Setup Instructions
+#Setup Instructions
 Step 1: Prepare the Pololu 3pi+ 2040 Robot
 
 Install Lingua Franca toolchain
