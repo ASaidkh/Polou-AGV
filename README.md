@@ -1,4 +1,4 @@
-## Line Following AGV with Bluetooth Control - Setup Guide
+### Line Following AGV with Bluetooth Control - Setup Guide
 This guide explains how to set up the Raspberry Pi Pico W2 and Pololu 3pi+ 2040 Robot for the networked line-following AGV project.
 # Hardware Requirements
 
